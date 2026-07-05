@@ -8,6 +8,42 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// Fixed-capacity stack-allocated vector for counter references.
+/// Avoids 2 heap allocations per connection in the relay hot path.
+/// Capacity 4 covers: traffic + domain + client + (optional) inbound.
+pub struct StackVec<'a, const N: usize> {
+    items: [Option<&'a AtomicU64>; N],
+    len: usize,
+}
+
+impl<'a, const N: usize> StackVec<'a, N> {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            items: [const { None }; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, val: &'a AtomicU64) {
+        debug_assert!(self.len < N, "StackVec overflow");
+        self.items[self.len] = Some(val);
+        self.len += 1;
+    }
+}
+
+impl<'a, const N: usize> StackVec<'a, N> {
+    #[inline]
+    pub fn increment_all(&self, n: u64) {
+        for item in &self.items[..self.len] {
+            if let Some(c) = item {
+                c.fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 static BUFFER_POOL: OnceLock<ArrayQueue<Box<[u8]>>> = OnceLock::new();
 const BUFFER_SIZE: usize = 65536;
 
@@ -139,8 +175,8 @@ pub fn defer_drop(stream: impl Send + 'static) {
 pub async fn relay<'a, A, B>(
     client: &mut A,
     backend: &mut B,
-    up_counters: Vec<&'a AtomicU64>,
-    down_counters: Vec<&'a AtomicU64>,
+    up_counters: StackVec<'a, 4>,
+    down_counters: StackVec<'a, 4>,
 ) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + AsRawStreamRef,
@@ -158,8 +194,8 @@ where
                 stream_a,
                 stream_b,
                 pipes,
-                up_counters.clone(),
-                down_counters.clone(),
+                &up_counters,
+                &down_counters,
             )
             .await
             {
@@ -168,7 +204,7 @@ where
         }
     }
 
-    large_copy_bidirectional_fallback(client, backend, up_counters, down_counters).await
+    large_copy_bidirectional_fallback(client, backend, &up_counters, &down_counters).await
 }
 
 struct TransferState<'a> {
@@ -177,7 +213,7 @@ struct TransferState<'a> {
     cap: usize,
     amt: u64,
     buf: Option<Box<[u8]>>,
-    counters: Vec<&'a AtomicU64>,
+    counters: &'a StackVec<'a, 4>,
 }
 
 impl<'a> Drop for TransferState<'a> {
@@ -189,7 +225,7 @@ impl<'a> Drop for TransferState<'a> {
 }
 
 impl<'a> TransferState<'a> {
-    fn new(counters: Vec<&'a AtomicU64>) -> Self {
+    fn new(counters: &'a StackVec<'a, 4>) -> Self {
         let buf = get_buffer_pool()
             .pop()
             .unwrap_or_else(|| vec![0; BUFFER_SIZE].into_boxed_slice());
@@ -249,9 +285,7 @@ where
                 std::task::Poll::Ready(Ok(n)) => {
                     state.pos += n;
                     state.amt += n as u64;
-                    for c in &state.counters {
-                        c.fetch_add(n as u64, Ordering::Relaxed);
-                    }
+                    state.counters.increment_all(n as u64);
                 }
                 std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                 std::task::Poll::Pending => return std::task::Poll::Pending,
@@ -329,8 +363,8 @@ where
 pub async fn large_copy_bidirectional_fallback<'a, A, B>(
     client: &mut A,
     backend: &mut B,
-    up_counters: Vec<&'a AtomicU64>,
-    down_counters: Vec<&'a AtomicU64>,
+    up_counters: &'a StackVec<'a, 4>,
+    down_counters: &'a StackVec<'a, 4>,
 ) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -445,7 +479,7 @@ async fn splice_one_way<'a>(
     w_stream: RawStreamRef<'_>,
     pipe_rd: OwnedFd,
     pipe_wr: OwnedFd,
-    counters: Vec<&'a AtomicU64>,
+    counters: &'a StackVec<'a, 4>,
 ) -> std::io::Result<u64> {
     use std::os::unix::io::AsRawFd;
 
@@ -517,9 +551,7 @@ async fn splice_one_way<'a>(
             written += res as usize;
         }
         total_bytes += written as u64;
-        for c in &counters {
-            c.fetch_add(written as u64, Ordering::Relaxed);
-        }
+        counters.increment_all(written as u64);
     }
     Ok(total_bytes)
 }
@@ -529,8 +561,8 @@ pub async fn splice_bidirectional_with_pipes<'a>(
     stream_a: RawStreamRef<'_>,
     stream_b: RawStreamRef<'_>,
     pipes: Option<PreallocatedPipes>,
-    up_counters: Vec<&'a AtomicU64>,
-    down_counters: Vec<&'a AtomicU64>,
+    up_counters: &'a StackVec<'a, 4>,
+    down_counters: &'a StackVec<'a, 4>,
 ) -> std::io::Result<(u64, u64)> {
     let (pipe1_rd, pipe1_wr, pipe2_rd, pipe2_wr) = match pipes {
         Some(p) => (p.pipe1_rd, p.pipe1_wr, p.pipe2_rd, p.pipe2_wr),

@@ -27,11 +27,24 @@ function App() {
   const [inboundSpeeds, setInboundSpeeds] = useState({});
   const [backendSpeeds, setBackendSpeeds] = useState({});
 
+  // CPU & Memory history for line charts
+  const previousCpuRef = useRef(null);
+  const [cpuHistory, setCpuHistory] = useState(() => Array(30).fill({ time: '', cpu: 0 }));
+  const [memHistory, setMemHistory] = useState(() => Array(30).fill({ time: '', rss: 0 }));
+
   // Sync API host to localStorage
   const handleApiHostChange = (e) => {
     const val = e.target.value;
     setApiHost(val);
     localStorage.setItem('proxylb_api_host', val);
+  };
+
+  // Utility: push a new entry into a fixed-length rolling history array.
+  const pushHistory = (arr, entry) => {
+    const next = [...arr];
+    next.shift();
+    next.push(entry);
+    return next;
   };
 
   // Fetch status helper
@@ -46,11 +59,11 @@ function App() {
       
       const now = Date.now();
       const timeDiffSec = (now - lastFetchTimeRef.current) / 1000;
+      const timeLabel = new Date(now).toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' });
       
       if (json.inbounds && timeDiffSec > 0) {
         setInboundSpeeds(prevSpeeds => {
           const nextSpeeds = { ...prevSpeeds };
-          const timeLabel = new Date(now).toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' });
           json.inbounds.forEach(inbound => {
             const prev = previousInboundsRef.current[inbound.listen];
             let txSpeed = 0;
@@ -65,10 +78,10 @@ function App() {
             if (!nextSpeeds[inbound.listen]) {
               nextSpeeds[inbound.listen] = Array(10).fill({ time: '', tx_speed: 0, rx_speed: 0 });
             }
-            const history = [...nextSpeeds[inbound.listen]];
-            history.shift(); // remove oldest
-            history.push({ time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed });
-            nextSpeeds[inbound.listen] = history;
+            nextSpeeds[inbound.listen] = pushHistory(
+              nextSpeeds[inbound.listen],
+              { time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed }
+            );
             
             previousInboundsRef.current[inbound.listen] = {
               tx_bytes: inbound.tx_bytes,
@@ -82,7 +95,6 @@ function App() {
       if (json.backends && timeDiffSec > 0) {
         setBackendSpeeds(prevSpeeds => {
           const nextSpeeds = { ...prevSpeeds };
-          const timeLabel = new Date(now).toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' });
           json.backends.forEach(b => {
             const prev = previousBackendsRef.current[b.name];
             let txSpeed = 0;
@@ -97,10 +109,10 @@ function App() {
             if (!nextSpeeds[b.name]) {
               nextSpeeds[b.name] = Array(10).fill({ time: '', tx_speed: 0, rx_speed: 0 });
             }
-            const history = [...nextSpeeds[b.name]];
-            history.shift();
-            history.push({ time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed });
-            nextSpeeds[b.name] = history;
+            nextSpeeds[b.name] = pushHistory(
+              nextSpeeds[b.name],
+              { time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed }
+            );
             
             previousBackendsRef.current[b.name] = {
               bytes_up: b.bytes_up,
@@ -110,6 +122,26 @@ function App() {
           return nextSpeeds;
         });
       }
+      // CPU usage computation from cumulative times
+      if (json.cpu && timeDiffSec > 0) {
+        const cur = json.cpu;
+        const curTotal = cur.user_time_us + cur.system_time_us;
+        const prev = previousCpuRef.current;
+        let cpuPercent = 0;
+        if (prev !== null) {
+          const deltaCpu = curTotal - prev.total;
+          const deltaWallUs = timeDiffSec * 1_000_000;
+          cpuPercent = Math.min(100, Math.max(0, (deltaCpu / (deltaWallUs * cur.num_cpus)) * 100));
+        }
+        previousCpuRef.current = { total: curTotal };
+        setCpuHistory(h => pushHistory(h, { time: timeLabel, cpu: Number(cpuPercent.toFixed(1)) }));
+      }
+
+      // Memory history
+      if (json.memory) {
+        setMemHistory(h => pushHistory(h, { time: timeLabel, rss: json.memory.rss }));
+      }
+
       lastFetchTimeRef.current = now;
       
       setData(json);
@@ -603,17 +635,57 @@ function App() {
           </div>
         </div>
 
+        {/* CPU Usage */}
+        <div className="summary-card">
+          <div className="summary-card-header">
+            <span className="summary-card-title">CPU Usage</span>
+            <span className="summary-card-icon">⚙️</span>
+          </div>
+          <div className="summary-card-value">
+            {cpuHistory[cpuHistory.length - 1]?.cpu?.toFixed(1) || '0.0'}%
+          </div>
+          <div style={{ height: '50px', marginTop: '4px' }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={cpuHistory}>
+                <Line type="monotone" dataKey="cpu" stroke="#ff7043" strokeWidth={2} dot={false} isAnimationActive={false} />
+                <YAxis hide domain={[0, 'auto']} />
+                <Tooltip
+                  contentStyle={{ backgroundColor: 'rgba(0,0,0,0.8)', border: 'none', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}
+                  formatter={(value) => `${value}%`}
+                  labelFormatter={() => ''}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="summary-card-subtext">
+            {data?.cpu?.num_cpus || '?'} logical CPUs
+          </div>
+        </div>
+
         {/* Memory Footprint */}
         <div className="summary-card">
           <div className="summary-card-header">
-            <span className="summary-card-title">Memory Footprint</span>
+            <span className="summary-card-title">Memory (RSS)</span>
             <span className="summary-card-icon">🧠</span>
           </div>
           <div className="summary-card-value">
             {data?.memory?.rss ? formatBytes(data.memory.rss) : 'N/A'}
           </div>
+          <div style={{ height: '50px', marginTop: '4px' }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={memHistory}>
+                <Line type="monotone" dataKey="rss" stroke="#ab47bc" strokeWidth={2} dot={false} isAnimationActive={false} />
+                <YAxis hide domain={['auto', 'auto']} />
+                <Tooltip
+                  contentStyle={{ backgroundColor: 'rgba(0,0,0,0.8)', border: 'none', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}
+                  formatter={(value) => formatBytes(value)}
+                  labelFormatter={() => ''}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
           <div className="summary-card-subtext">
-            VM Size: {data?.memory?.vmsize ? formatBytes(data.memory.vmsize) : 'Linux only'}
+            VM: {data?.memory?.vmsize ? formatBytes(data.memory.vmsize) : 'N/A'}
           </div>
         </div>
 

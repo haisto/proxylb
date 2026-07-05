@@ -16,7 +16,9 @@ pub enum GroupMember {
 pub struct Group {
     pub name: String,
     pub strategy: GroupStrategy,
+    pub unhealthy_ratio: f32,
     pub members: Vec<GroupMember>,
+    pub hooks: Vec<String>,
 }
 
 impl Group {
@@ -75,16 +77,16 @@ pub fn build_groups_and_failover_order(
     group_configs: &[GroupConfig],
     failover_order_cfg: Option<&Vec<String>>,
 ) -> (Vec<Group>, Vec<Target>) {
-    // First pass: create groups with name-only references so we can build an
-    // index map. We resolve the actual GroupMember variants in a second pass.
-    let group_name_to_idx: HashMap<&str, usize> = group_configs
+    let enabled_groups: Vec<&GroupConfig> = group_configs.iter().filter(|gc| gc.enabled).collect();
+
+    let group_name_to_idx: HashMap<&str, usize> = enabled_groups
         .iter()
         .enumerate()
         .map(|(i, gc)| (gc.name.as_str(), i))
         .collect();
 
-    let mut groups = Vec::with_capacity(group_configs.len());
-    for gc in group_configs {
+    let mut groups = Vec::with_capacity(enabled_groups.len());
+    for gc in enabled_groups {
         let mut members = Vec::new();
         for member_cfg in &gc.members {
             let member_name = member_cfg.name();
@@ -98,7 +100,9 @@ pub fn build_groups_and_failover_order(
         groups.push(Group {
             name: gc.name.clone(),
             strategy: gc.strategy,
+            unhealthy_ratio: gc.unhealthy_ratio,
             members,
+            hooks: gc.hooks.clone(),
         });
     }
 

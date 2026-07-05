@@ -31,10 +31,13 @@ High-performance proxy load balancer written in Rust. Supports SOCKS5, Shadowsoc
 - **Network Awareness:** Automatically reprobes when link or gateway changes are detected.
 - **Embedded Web Dashboard:** A zero-dependency React Web UI compiled directly into the binary, featuring real-time bandwidth time-series charts, client tracking, and backend latency metrics. See [REST API Documentation](./restapi.md).
 - **Built-in AdBlock:** Periodically fetches and updates AdGuard/Hosts blocklists (disabled by default for zero-overhead routing).
+- **Event-Driven Hooks:** Integrate with external scripts (e.g., Telegram bots, webhooks) to receive instant, lock-free, real-time notifications whenever a backend or group health state changes.
 
 ---
 
 ## ⚡ Performance
+
+👉 Deep Dive: [ProxyLB Worker Core Logic Performance Analysis](performance_en.md)
 
 ProxyLB is built for maximum throughput and low latency:
 
@@ -128,6 +131,8 @@ backends:
     address: "12.34.56.78:1080"
     username: "user"
     password: "pass"
+    unhealthy_threshold: 1
+    recover_threshold: 3
     pool_size: 10
   - name: "ss-hk-1"
     type: "shadowsocks"
@@ -139,6 +144,8 @@ backends:
 groups:
   # Sub-groups
   - name: "asia-group"
+    enabled: true
+    unhealthy_ratio: 0.8
     strategy: "urltest"
     members: ["ss-hk-1"]
   - name: "us-fallback"
@@ -177,6 +184,22 @@ cpu_affinity:
 
 advanced:
   zero_copy: true   # splice(2) on Linux, default on
+
+# Hook Plugin Framework (e.g., Telegram Bot Notification)
+hooks:
+  - name: "tg_bot"
+    type: script
+    script_path: "/var/lib/proxylb/tg_bot.sh"
+
+# You can bind hooks to specific backends:
+# backends:
+#   - name: "us-east-1"
+#     hooks: ["tg_bot"]
+# 
+# Or bind them to groups:
+# groups:
+#   - name: "region-us"
+#     hooks: ["tg_bot"]
 ```
 
 ---

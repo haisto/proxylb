@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)]
     pub advanced: AdvancedConfig,
+    #[serde(default)]
+    pub hooks: Vec<HookConfig>,
     /// Directory for runtime data like the SQLite database.
     pub run_dir: Option<String>,
 }
@@ -177,12 +179,26 @@ fn default_weight() -> u32 {
 #[derive(Debug, Deserialize, Clone)]
 pub struct GroupConfig {
     pub name: String,
+    #[serde(default = "default_group_enabled")]
+    pub enabled: bool,
     #[serde(default)]
     pub strategy: GroupStrategy,
     /// Members can be backend names or other group names (nested groups).
     /// Accepts both `members` and legacy `backends` key in YAML.
     #[serde(alias = "backends")]
     pub members: Vec<GroupMemberConfig>,
+    #[serde(default = "default_unhealthy_ratio")]
+    pub unhealthy_ratio: f32,
+    #[serde(default)]
+    pub hooks: Vec<String>,
+}
+
+fn default_unhealthy_ratio() -> f32 {
+    1.0
+}
+
+fn default_group_enabled() -> bool {
+    true
 }
 
 /// Inbound listener configuration.
@@ -334,18 +350,28 @@ pub struct BackendConfig {
     /// If true, do not perform health check and consider healthy forever (default: false).
     #[serde(default)]
     pub force_healthy: bool,
+    /// List of hook names to trigger on state change.
+    #[serde(default)]
+    pub hooks: Vec<String>,
     #[serde(default)]
     pub network: Option<String>,
     /// Number of consecutive failures before marking the backend as unhealthy (default: 1).
-    #[serde(default = "default_max_fails")]
-    pub max_fails: u32,
+    #[serde(default = "default_unhealthy_threshold", alias = "max_fails")]
+    pub unhealthy_threshold: u32,
+    /// Number of consecutive successful checks before marking the backend as healthy again (default: 5).
+    #[serde(default = "default_recover_threshold")]
+    pub recover_threshold: u32,
     /// TCP specific configuration.
     #[serde(default)]
     pub tcp: Option<TcpConfig>,
 }
 
-fn default_max_fails() -> u32 {
+fn default_unhealthy_threshold() -> u32 {
     1
+}
+
+fn default_recover_threshold() -> u32 {
+    5
 }
 
 fn default_pool_size() -> usize {
@@ -663,6 +689,19 @@ impl Config {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HookConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub plugin: HookPluginConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum HookPluginConfig {
+    Script { script_path: String },
 }
 
 #[cfg(test)]

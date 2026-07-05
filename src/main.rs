@@ -4,13 +4,15 @@
 //! an ordered list of SOCKS5h backends with health checking and failover.
 
 mod backend;
-mod config;
-mod filter;
-mod health;
-mod inbound;
+pub mod config;
+pub mod filter;
+pub mod health;
+pub mod hook;
+pub mod inbound;
 mod outbound;
 mod relay;
 mod route_watcher;
+pub mod router;
 mod scheduler;
 pub mod stats;
 pub mod tls;
@@ -216,6 +218,8 @@ async fn main_async(
         .to_string()
         + "/proxylb.db";
 
+    let (hook_tx, hook_rx) = tokio::sync::mpsc::unbounded_channel();
+
     // Initialize backend pool.
     let pool = backend::BackendPool::new(
         &config.backends,
@@ -227,7 +231,11 @@ async fn main_async(
         ancillary_handle.clone(),
         active_routes,
         Some(db_path),
+        Some(hook_tx.clone()),
     )?;
+
+    let hook_manager = crate::hook::HookManager::new(&config.hooks, hook_rx, pool.clone());
+    ancillary_handle.spawn(hook_manager.run());
 
     let mut ancillary_handles = Vec::new();
     // Spawn filter background manager task if enabled
@@ -635,6 +643,7 @@ async fn main_async(
                     &mut adblock_cancel,
                     &initial_inbounds,
                     &ancillary_handle,
+                    Some(hook_tx.clone()),
                 )
                 .await;
             }
@@ -670,6 +679,7 @@ async fn perform_hot_reload(
     adblock_cancel: &mut CancellationToken,
     initial_inbounds: &[config::InboundItemConfig],
     ancillary_handle: &tokio::runtime::Handle,
+    hook_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hook::HookEvent>>,
 ) {
     let new_config = match config::Config::load(config_path) {
         Ok(c) => c,
@@ -710,6 +720,7 @@ async fn perform_hot_reload(
             &new_config.groups,
             new_config.failover_order.as_ref(),
             new_config.bind_interface.as_deref(),
+            hook_tx,
         )
         .await
     {
