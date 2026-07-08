@@ -154,7 +154,7 @@ where
 
     // Try backends in order with fallback.
     let (mut backend_stream, chosen_traffic) =
-        match crate::inbound::route_and_connect(&pool, &target, route_idx).await {
+        match crate::router::route_and_connect(&pool, &target, route_idx).await {
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(

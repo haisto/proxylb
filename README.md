@@ -31,10 +31,13 @@
 - **网络状态感知:** 检测到链路或网关变更时自动触发重新探测。
 - **内置 Web 仪表盘:** 零依赖的 React Web UI，直接编译打包进二进制文件中。支持 10 秒实时流量波形图、客户端追踪和后端延迟可视化。查阅 [RESTful API 接口文档](./restapi.md)。
 - **内置 AdBlock:** 在后台定期获取并刷新 AdGuard/Hosts 格式的过滤规则（默认关闭，以保证零开销纯代理转发）。
+- **事件驱动钩子 (Hooks)：** 可无缝集成外部脚本或 Webhook（如 Telegram 机器人），在后端或策略组健康状态发生变化时，提供无锁、实时的即时通知。
 
 ---
 
 ## ⚡ 性能
+
+👉 深入了解：[ProxyLB Worker 核心逻辑性能分析](performance.md)
 
 ProxyLB 为最大吞吐量和极低延迟而生：
 
@@ -128,6 +131,8 @@ backends:
     address: "12.34.56.78:1080"
     username: "user"
     password: "pass"
+    unhealthy_threshold: 1
+    recover_threshold: 3
     pool_size: 10
   - name: "ss-hk-1"
     type: "shadowsocks"
@@ -139,6 +144,8 @@ backends:
 groups:
   # 子策略组
   - name: "asia-group"
+    enabled: true
+    unhealthy_ratio: 0.8
     strategy: "urltest"
     members: ["ss-hk-1"]
   - name: "us-fallback"
@@ -177,6 +184,22 @@ cpu_affinity:
 
 advanced:
   zero_copy: true   # Linux 下启用 splice(2)，默认开启
+
+# 钩子 (Hooks) 插件配置 (例如：Telegram 机器人通知)
+hooks:
+  - name: "tg_bot"
+    type: script
+    script_path: "/var/lib/proxylb/tg_bot.sh"
+
+# 您可以将钩子绑定到特定的后端:
+# backends:
+#   - name: "us-east-1"
+#     hooks: ["tg_bot"]
+# 
+# 或者绑定到整个组:
+# groups:
+#   - name: "region-us"
+#     hooks: ["tg_bot"]
 ```
 
 ---

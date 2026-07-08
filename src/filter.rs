@@ -241,7 +241,7 @@ mod imp {
             if engine.is_blocked(host) {
                 self.blocked_requests.fetch_add(1, Ordering::Relaxed);
                 // Zero-alloc parent domain extraction for stats tracking.
-                let parent = crate::inbound::extract_parent_domain_str(host);
+                let parent = crate::router::extract_parent_domain_str(host);
                 self.blocked_domains_manager.increment_block(parent);
                 true
             } else {

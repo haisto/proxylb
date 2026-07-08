@@ -10,10 +10,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::Serialize;
-use shadowsocks::config::ServerConfig as SsServerConfig;
-use shadowsocks::context::{Context as SsContext, SharedContext};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -21,334 +19,13 @@ use crate::config::{BackendConfig, GroupConfig};
 use crate::outbound::BackendStream;
 use crate::scheduler::*;
 use std::collections::HashMap;
-use tokio_rustls::TlsConnector;
 
-/// Lock-free per-backend traffic counters.
-///
-/// Stored behind an `Arc` so inbound relay tasks can hold a clone without
-/// acquiring the pool's `RwLock` on every byte count update.
-#[derive(Debug, Default)]
-pub struct TrafficCounters {
-    /// Bytes relayed from client → backend (cumulative).
-    pub bytes_up: AtomicU64,
-    /// Bytes relayed from backend → client (cumulative).
-    pub bytes_down: AtomicU64,
-    /// Currently active relay sessions (signed so a race never wraps).
-    pub active_connections: AtomicI64,
-    /// Total connections ever accepted through this backend.
-    pub total_connections: AtomicU64,
-    // --- Connection pool stats ---
-    /// Worker grabbed a pooled connection and it succeeded.
-    pub pool_hits: AtomicU64,
-    /// Pool was empty; worker fell back to a fresh on-demand connection.
-    pub pool_misses: AtomicU64,
-    /// Pooled connection was stale; worker transparently retried with a fresh one.
-    pub pool_stale: AtomicU64,
-}
+use crate::backend::{health_status::*, info::*, stats::*};
 
-/// Maximum number of health check history entries per backend.
-const MAX_HISTORY: usize = 10;
-
-/// How the load balancer connects to a SOCKS5 backend.
-#[derive(Debug, Clone)]
-pub enum BackendEndpoint {
-    /// Classic TCP connection to `host:port`.
-    Tcp { host: String, port: u16 },
-    /// Unix domain socket at the given filesystem path.
-    Unix { path: String },
-    /// Direct connection outbound.
-    Direct,
-}
-
-impl BackendEndpoint {
-    /// Human-readable address string (used in the web dashboard).
-    pub fn display(&self) -> String {
-        match self {
-            BackendEndpoint::Tcp { host, port } => format!("{}:{}", host, port),
-            BackendEndpoint::Unix { path } => format!("unix:{}", path),
-            BackendEndpoint::Direct => "direct".to_string(),
-        }
-    }
-}
-
-/// Parsed backend information.
-#[derive(Clone)]
-pub struct BackendInfo {
-    pub name: String,
-    pub endpoint: BackendEndpoint,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub pool_size: usize,
-    /// Set when this backend is a Shadowsocks server.
-    /// Contains the pre-derived key material (cheap to clone — inner is `Arc`).
-    pub ss_config: Option<Arc<SsServerConfig>>,
-    /// Shared Shadowsocks context — one per backend, reused across pool connections.
-    pub ss_context: Option<SharedContext>,
-    pub bind_interface: Option<String>,
-    pub tls_connector: Option<TlsConnector>,
-    pub server_name: Option<String>,
-    pub enabled: Option<bool>,
-    pub force_healthy: bool,
-    pub max_fails: u32,
-    pub udp_enabled: bool,
-    pub anytls_manager: Option<Arc<crate::outbound::anytls::AnytlsManager>>,
-    pub tcp_congestion: Option<String>,
-}
-
-impl std::fmt::Debug for BackendInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BackendInfo")
-            .field("name", &self.name)
-            .field("endpoint", &self.endpoint)
-            .finish_non_exhaustive()
-    }
-}
-
-impl BackendInfo {
-    pub fn from_config(
-        cfg: &BackendConfig,
-        index: usize,
-        global_bind_interface: Option<&str>,
-    ) -> anyhow::Result<Self> {
-        let is_direct = cfg.backend_type == "direct";
-
-        let endpoint = match cfg.backend_type.as_str() {
-            "direct" => BackendEndpoint::Direct,
-            "socks5" | "ss" | "shadowsocks" | "uds" | "anytls" => {
-                let addr = cfg
-                    .address
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("backend must specify address"))?;
-                if addr.starts_with("unix://") {
-                    let path = addr.strip_prefix("unix://").unwrap().to_string();
-                    BackendEndpoint::Unix { path }
-                } else if addr.starts_with('/')
-                    || addr.starts_with("./")
-                    || addr.starts_with("../")
-                    || cfg.backend_type == "uds"
-                {
-                    let path = if let Some(stripped) = addr.strip_prefix("unix://") {
-                        stripped.to_string()
-                    } else {
-                        addr.clone()
-                    };
-                    BackendEndpoint::Unix { path }
-                } else {
-                    // Parse "host:port"
-                    if let Some(pos) = addr.rfind(':') {
-                        let host = addr[..pos].to_string();
-                        let port: u16 = addr[pos + 1..].parse().map_err(|_| {
-                            anyhow::anyhow!("invalid port in backend address: {}", addr)
-                        })?;
-                        BackendEndpoint::Tcp { host, port }
-                    } else {
-                        anyhow::bail!(
-                            "backend address must be in host:port or unix://path format: {}",
-                            addr
-                        );
-                    }
-                }
-            }
-            other => anyhow::bail!("unknown backend type: {}", other),
-        };
-
-        let name = cfg.name.clone().unwrap_or_else(|| {
-            if is_direct {
-                format!("direct-{}", index)
-            } else {
-                format!("backend-{}", index)
-            }
-        });
-
-        // Build Shadowsocks config if this is an SS backend.
-        let (ss_config, ss_context) =
-            if cfg.backend_type == "ss" || cfg.backend_type == "shadowsocks" {
-                let method_str = cfg.username.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("ss backend must specify method in username field")
-                })?;
-                let pass = cfg.password.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("ss backend must specify password in password field")
-                })?;
-                let addr = cfg
-                    .address
-                    .as_deref()
-                    .expect("ss backend must have address");
-                let dummy_sock: std::net::SocketAddr = if addr.starts_with("unix://")
-                    || addr.starts_with('/')
-                    || addr.starts_with("./")
-                    || addr.starts_with("../")
-                {
-                    "0.0.0.0:0".parse().unwrap()
-                } else {
-                    addr.parse()
-                        .or_else(|_| {
-                            if let Some(pos) = addr.rfind(':') {
-                                let port: u16 = addr[pos + 1..].parse()?;
-                                let host_str = &addr[..pos];
-                                let ip: std::net::IpAddr = host_str.parse().unwrap_or(
-                                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                                );
-                                Ok(std::net::SocketAddr::new(ip, port))
-                            } else {
-                                Err(anyhow::anyhow!("invalid address"))
-                            }
-                        })
-                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
-                };
-
-                let method: shadowsocks::crypto::CipherKind = method_str
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("unsupported ss_method: {}", method_str))?;
-
-                let ss_cfg = SsServerConfig::new(dummy_sock, pass, method).map_err(|e| {
-                    anyhow::anyhow!("shadowsocks config error for backend '{}': {}", name, e)
-                })?;
-
-                let ctx = SsContext::new_shared(shadowsocks::config::ServerType::Local);
-                (Some(Arc::new(ss_cfg)), Some(ctx))
-            } else {
-                (None, None)
-            };
-
-        let pool_size = if is_direct { 0 } else { cfg.pool_size };
-        let bind_interface = cfg
-            .bind_interface
-            .clone()
-            .or_else(|| global_bind_interface.map(String::from));
-
-        let tls_connector = if let Some(tls) = &cfg.tls {
-            Some(crate::tls::create_tls_connector(tls.insecure)?)
-        } else {
-            None
-        };
-
-        let server_name = cfg.tls.as_ref().and_then(|tls| tls.server_name.clone());
-
-        let anytls_manager = if cfg.backend_type == "anytls" {
-            let password = cfg.password.as_deref().unwrap_or("").to_string();
-            Some(Arc::new(crate::outbound::anytls::AnytlsManager::new(
-                password,
-                if pool_size > 0 { pool_size } else { 1 },
-            )))
-        } else {
-            None
-        };
-
-        Ok(Self {
-            name,
-            endpoint,
-            username: cfg.username.clone(),
-            password: cfg.password.clone(),
-            pool_size,
-            ss_config,
-            ss_context,
-            bind_interface,
-            tls_connector,
-            server_name,
-            enabled: cfg.enabled,
-            force_healthy: cfg.force_healthy,
-            max_fails: cfg.max_fails,
-            udp_enabled: cfg.network.as_deref() == Some("tcp_udp"),
-            anytls_manager,
-            tcp_congestion: cfg.tcp.as_ref().and_then(|t| t.congestion.clone()),
-        })
-    }
-
-    /// Returns `true` if this is a Shadowsocks backend.
-    pub fn is_shadowsocks(&self) -> bool {
-        self.ss_config.is_some()
-    }
-
-    /// Returns `true` if this is a direct connection outbound backend.
-    pub fn is_direct(&self) -> bool {
-        matches!(self.endpoint, BackendEndpoint::Direct)
-    }
-
-    /// Returns `true` if this is an AnyTLS outbound backend.
-    pub fn is_anytls(&self) -> bool {
-        self.anytls_manager.is_some()
-    }
-
-    /// Returns true if this backend requires SOCKS5 authentication.
-    pub fn requires_auth(&self) -> bool {
-        self.username.is_some() && self.password.is_some()
-    }
-
-    pub async fn connect_target_pooled(
-        &self,
-        stream: crate::outbound::BackendStream,
-        target: &crate::outbound::TargetAddr,
-    ) -> std::io::Result<crate::outbound::BackendStream> {
-        if self.is_shadowsocks() {
-            let ss_cfg = self.ss_config.as_ref().unwrap();
-            let ss_ctx = self.ss_context.as_ref().unwrap().clone();
-            Ok(crate::outbound::ss_connect_pooled(
-                stream, ss_cfg, ss_ctx, target,
-            ))
-        } else if self.is_anytls() {
-            crate::outbound::anytls::anytls_connect_target(stream, target).await
-        } else if self.is_direct() {
-            unreachable!("Direct backend should not have pooled streams")
-        } else {
-            crate::outbound::socks5h_connect_target(stream, target).await
-        }
-    }
-
-    pub async fn connect_target_fresh(
-        &self,
-        target: &crate::outbound::TargetAddr,
-        timeout: std::time::Duration,
-    ) -> std::io::Result<crate::outbound::BackendStream> {
-        if self.is_direct() {
-            crate::outbound::direct_connect(target, timeout, self.bind_interface.as_deref()).await
-        } else if self.is_shadowsocks() {
-            let ss_cfg = self.ss_config.as_ref().unwrap();
-            let ss_ctx = self.ss_context.as_ref().unwrap().clone();
-            crate::outbound::ss_connect_fresh(self, ss_cfg, ss_ctx, target, timeout).await
-        } else if self.is_anytls() {
-            let s = crate::outbound::anytls::anytls_connect_fresh(self).await?;
-            crate::outbound::anytls::anytls_connect_target(s, target).await
-        } else {
-            crate::outbound::socks5h_connect(self, target, timeout).await
-        }
-    }
-}
-
-/// A single health check result.
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthCheckResult {
-    pub timestamp: DateTime<Utc>,
-    pub success: bool,
-    pub latency_ms: Option<u64>,
-    pub handshake_latency_ms: Option<u64>,
-    pub error: Option<String>,
-}
-
-/// Current status of a backend.
-#[derive(Debug, Clone)]
-pub struct BackendStatus {
-    pub healthy: bool,
-    pub enabled: bool,
-    pub last_check: Option<Instant>,
-    pub last_latency: Option<Duration>,
-    pub last_handshake_latency: Option<Duration>,
-    pub consecutive_failures: u32,
-    pub history: VecDeque<HealthCheckResult>,
-}
-
-impl Default for BackendStatus {
-    fn default() -> Self {
-        Self {
-            // Assume healthy initially — the first health check will confirm.
-            healthy: true,
-            enabled: true,
-            last_check: None,
-            last_latency: None,
-            last_handshake_latency: None,
-            consecutive_failures: 0,
-            history: VecDeque::with_capacity(MAX_HISTORY),
-        }
-    }
+struct BackendPoolInner {
+    entries: Vec<BackendEntry>,
+    groups: Vec<Group>,
+    failover_order: Vec<Target>,
 }
 
 /// A single backend entry: info + status + traffic counters.
@@ -375,6 +52,7 @@ pub struct BackendStatusView {
     pub last_latency_ms: Option<u64>,
     pub handshake_latency_ms: Option<u64>,
     pub consecutive_failures: u32,
+    pub consecutive_successes: u32,
     pub history: Vec<HealthCheckResult>,
     // Traffic stats
     pub bytes_up: u64,
@@ -415,41 +93,16 @@ pub struct PooledConn {
 }
 
 #[derive(Debug)]
-pub struct InboundStats {
-    pub name: String,
-    pub listen: String,
-    pub inbound_type: String,
-    pub total_connections: AtomicU64,
-    pub active_connections: AtomicI64,
-    pub tx_bytes: AtomicU64,
-    pub rx_bytes: AtomicU64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct InboundStatsView {
-    pub name: String,
-    pub listen: String,
-    pub inbound_type: String,
-    pub total_connections: u64,
-    pub active_connections: i64,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-}
-
-struct BackendPoolInner {
-    entries: Vec<BackendEntry>,
-    groups: Vec<Group>,
-    failover_order: Vec<Target>,
-}
-
-#[derive(Clone)]
 pub struct BackendHotPath {
     pub pool_rx: flume::Receiver<BackendStream>,
     pub traffic: Arc<TrafficCounters>,
     pub status: Arc<parking_lot::Mutex<BackendStatus>>,
     pub info_name: Arc<str>,
     pub force_healthy: bool,
-    pub max_fails: u32,
+    pub unhealthy_threshold: u32,
+    pub recover_threshold: u32,
+    pub hook_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hook::HookEvent>>,
+    pub hooks: Arc<Vec<String>>,
 }
 
 /// Thread-safe backend pool.
@@ -482,6 +135,7 @@ impl BackendPool {
         ancillary_handle: tokio::runtime::Handle,
         active_routes: std::collections::HashSet<String>,
         db_path: Option<String>,
+        hook_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hook::HookEvent>>,
     ) -> anyhow::Result<Self> {
         let mut persisted_states = std::collections::HashMap::new();
 
@@ -567,7 +221,10 @@ impl BackendPool {
                 status: Arc::clone(&e.status),
                 info_name: Arc::from(e.info.name.as_str()),
                 force_healthy: e.info.force_healthy,
-                max_fails: e.info.max_fails,
+                unhealthy_threshold: e.info.unhealthy_threshold,
+                recover_threshold: e.info.recover_threshold,
+                hook_tx: hook_tx.clone(),
+                hooks: Arc::new(e.info.hooks.clone()),
             })
             .collect::<Vec<_>>();
         let hot_paths = Arc::new(ArcSwap::from_pointee(hot_paths));
@@ -634,6 +291,36 @@ impl BackendPool {
         stats
     }
 
+    pub async fn get_groups_snapshot(
+        &self,
+    ) -> std::collections::HashMap<String, (bool, Vec<String>)> {
+        let guard = self.inner.read().await;
+        let mut snapshot = std::collections::HashMap::with_capacity(guard.groups.len());
+        for group in &guard.groups {
+            let mut total_members = 0;
+            let mut unhealthy_members = 0;
+            let backend_indices = group.flatten_backend_indices(&guard.groups);
+
+            for idx in backend_indices {
+                if let Some(entry) = guard.entries.get(idx) {
+                    total_members += 1;
+                    if !entry.status.lock().healthy {
+                        unhealthy_members += 1;
+                    }
+                }
+            }
+
+            let is_healthy = if total_members == 0 {
+                true
+            } else {
+                let ratio = unhealthy_members as f32 / total_members as f32;
+                ratio < group.unhealthy_ratio
+            };
+            snapshot.insert(group.name.clone(), (is_healthy, group.hooks.clone()));
+        }
+        snapshot
+    }
+
     /// Retrieve a snapshot of the stats for all registered inbounds.
     pub fn get_inbound_stats(&self) -> Vec<InboundStatsView> {
         let stats_list = self.inbound_stats.lock();
@@ -666,6 +353,7 @@ impl BackendPool {
         group_configs: &[GroupConfig],
         failover_order_cfg: Option<&Vec<String>>,
         global_bind_interface: Option<&str>,
+        hook_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::hook::HookEvent>>,
     ) -> anyhow::Result<(usize, usize, usize)> {
         let mut persisted_states = std::collections::HashMap::new();
         if let Some(ref path) = self.db_path {
@@ -794,7 +482,10 @@ impl BackendPool {
                 status: Arc::clone(&e.status),
                 info_name: Arc::from(e.info.name.as_str()),
                 force_healthy: e.info.force_healthy,
-                max_fails: e.info.max_fails,
+                unhealthy_threshold: e.info.unhealthy_threshold,
+                recover_threshold: e.info.recover_threshold,
+                hook_tx: hook_tx.clone(),
+                hooks: Arc::new(e.info.hooks.clone()),
             })
             .collect::<Vec<_>>();
         self.hot_paths.store(Arc::new(hot_paths_vec));
@@ -892,11 +583,22 @@ impl BackendPool {
         if let Some(hp) = hot_paths.get(index) {
             let mut status = hp.status.lock();
             let was_unhealthy = !status.healthy;
-            status.healthy = true;
             status.last_check = Some(Instant::now());
             status.last_latency = Some(latency);
             if handshake_latency.is_some() {
                 status.last_handshake_latency = handshake_latency;
+            }
+            status.consecutive_successes += 1;
+            if status.consecutive_successes >= hp.recover_threshold {
+                if was_unhealthy {
+                    if let Some(tx) = &hp.hook_tx {
+                        let _ = tx.send(crate::hook::HookEvent::BackendRecovered(
+                            hp.info_name.to_string(),
+                            hp.hooks.as_ref().clone(),
+                        ));
+                    }
+                }
+                status.healthy = true;
             }
             status.consecutive_failures = 0;
 
@@ -930,12 +632,21 @@ impl BackendPool {
             }
             let mut status = hp.status.lock();
             let was_healthy = status.healthy;
-            // status.healthy will be set to false only if max_fails is reached
+            // status.healthy will be set to false only if unhealthy_threshold is reached
             status.last_check = Some(Instant::now());
             status.consecutive_failures += 1;
-            if status.consecutive_failures >= hp.max_fails {
+            if status.consecutive_failures >= hp.unhealthy_threshold {
+                if was_healthy {
+                    if let Some(tx) = &hp.hook_tx {
+                        let _ = tx.send(crate::hook::HookEvent::BackendFailed(
+                            hp.info_name.to_string(),
+                            hp.hooks.as_ref().clone(),
+                        ));
+                    }
+                }
                 status.healthy = false;
             }
+            status.consecutive_successes = 0;
 
             let result = HealthCheckResult {
                 timestamp: Utc::now(),
@@ -1062,6 +773,7 @@ impl BackendPool {
                 enabled: status.enabled,
                 last_latency_ms: status.last_latency.map(|d| d.as_millis() as u64),
                 consecutive_failures: status.consecutive_failures,
+                consecutive_successes: status.consecutive_successes,
                 history: status.history.iter().cloned().collect(),
                 bytes_up: e.traffic.bytes_up.load(Ordering::Relaxed),
                 bytes_down: e.traffic.bytes_down.load(Ordering::Relaxed),
@@ -1104,6 +816,7 @@ impl BackendPool {
                 enabled: status.enabled,
                 last_latency_ms: status.last_latency.map(|d| d.as_millis() as u64),
                 consecutive_failures: status.consecutive_failures,
+                consecutive_successes: status.consecutive_successes,
                 history: status.history.iter().cloned().collect(),
                 bytes_up: e.traffic.bytes_up.load(Ordering::Relaxed),
                 bytes_down: e.traffic.bytes_down.load(Ordering::Relaxed),
@@ -1336,7 +1049,7 @@ async fn refill_pool_task(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::backend::{health_status::*, info::*, pool::*, stats::*};
     use crate::config::GroupStrategy;
 
     fn make_cfg(addr: &str, name: &str) -> BackendConfig {

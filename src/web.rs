@@ -39,6 +39,119 @@ pub fn get_memory_usage() -> MemStats {
     }
 }
 
+/// CPU usage statistics.
+/// Returns cumulative CPU times so the frontend can compute instantaneous CPU%
+/// by diffing successive samples against wall-clock time.
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct CpuStats {
+    /// Cumulative user-mode CPU time in microseconds.
+    pub user_time_us: u64,
+    /// Cumulative system (kernel) CPU time in microseconds.
+    pub system_time_us: u64,
+    /// Number of logical CPUs (for normalizing to 0-100%).
+    pub num_cpus: usize,
+}
+
+pub fn get_cpu_usage() -> CpuStats {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+    }
+    let user_us = usage.ru_utime.tv_sec as u64 * 1_000_000 + usage.ru_utime.tv_usec as u64;
+    let sys_us = usage.ru_stime.tv_sec as u64 * 1_000_000 + usage.ru_stime.tv_usec as u64;
+    let cpus = get_effective_cpu_count();
+    CpuStats {
+        user_time_us: user_us,
+        system_time_us: sys_us,
+        num_cpus: cpus,
+    }
+}
+
+/// Returns the number of CPUs effectively available to this process.
+///
+/// On Linux, checks cgroup v2/v1 for cpuset and cpu quota limits (Docker
+/// `--cpuset-cpus`, `--cpus`). Falls back to `sysconf(_SC_NPROCESSORS_ONLN)`
+/// which gives the system-wide count — correct for bare-metal and macOS
+/// (even when individual threads are pinned to specific cores).
+fn get_effective_cpu_count() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(n) = cgroup_cpu_count() {
+            return n;
+        }
+    }
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if n > 0 { n as usize } else { 1 }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_cpu_count() -> Option<usize> {
+    // cgroup v2 cpuset (e.g. --cpuset-cpus=0,1)
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective") {
+        if let Some(n) = parse_cpuset_count(content.trim()) {
+            return Some(n);
+        }
+    }
+    // cgroup v2 cpu.max quota (e.g. --cpus=2)
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let parts: Vec<&str> = content.trim().split_whitespace().collect();
+        if parts.len() == 2 && parts[0] != "max" {
+            if let (Ok(quota), Ok(period)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                if period > 0 {
+                    let cpus = (quota as f64 / period as f64).ceil() as usize;
+                    if cpus > 0 {
+                        return Some(cpus);
+                    }
+                }
+            }
+        }
+    }
+    // cgroup v1 cpuset
+    if let Ok(content) = std::fs::read_to_string("/sys/fs/cgroup/cpuset/cpuset.cpus") {
+        if let Some(n) = parse_cpuset_count(content.trim()) {
+            return Some(n);
+        }
+    }
+    // cgroup v1 cpu quota
+    if let (Ok(quota_s), Ok(period_s)) = (
+        std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"),
+        std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+    ) {
+        if let (Ok(quota), Ok(period)) = (
+            quota_s.trim().parse::<i64>(),
+            period_s.trim().parse::<u64>(),
+        ) {
+            if quota > 0 && period > 0 {
+                let cpus = (quota as f64 / period as f64).ceil() as usize;
+                if cpus > 0 {
+                    return Some(cpus);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cpuset_count(s: &str) -> Option<usize> {
+    // Parses "0-3,5,7-9" format → counts individual CPUs (e.g. 8)
+    let mut count = 0usize;
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start.parse::<usize>(), end.parse::<usize>()) {
+                count += e - s + 1;
+            }
+        } else if part.parse::<usize>().is_ok() {
+            count += 1;
+        }
+    }
+    if count > 0 { Some(count) } else { None }
+}
+
 #[derive(Serialize)]
 struct AdBlockStatusView {
     enabled: bool,
@@ -53,6 +166,7 @@ struct ApiResponse {
     backends: Vec<crate::backend::BackendStatusView>,
     tree: Vec<crate::backend::TreeItem>,
     memory: MemStats,
+    cpu: CpuStats,
     inbounds: Vec<crate::backend::InboundStatsView>,
     clients: Vec<crate::stats::ClientStatsView>,
     domains: Vec<crate::stats::DomainStatsView>,
@@ -156,20 +270,12 @@ async fn api_disable_backend(
 /// Run the web status server.
 pub async fn run_web_server(listen_addr: String, pool: BackendPool) -> anyhow::Result<()> {
     let app = create_router(pool);
-    if listen_addr.starts_with("unix://") {
-        let mut path = listen_addr.strip_prefix("unix://").unwrap().to_string();
-        if !path.starts_with('/') {
-            path = format!("/{}", path);
-        }
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = tokio::fs::remove_file(&path).await;
-        let listener = tokio::net::UnixListener::bind(&path)?;
-        tracing::info!(listen = %path, "web status REST API started (UDS)");
-        axum::serve(listener, app).await?;
-    } else if listen_addr.starts_with("unix:") {
-        let mut path = listen_addr.strip_prefix("unix:").unwrap().to_string();
+    let uds_path = listen_addr
+        .strip_prefix("unix://")
+        .or_else(|| listen_addr.strip_prefix("unix:"));
+
+    if let Some(raw) = uds_path {
+        let mut path = raw.to_string();
         if !path.starts_with('/') {
             path = format!("/{}", path);
         }
@@ -270,6 +376,7 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
     let backends = pool.status_views().await;
     let tree = pool.status_tree().await;
     let memory = get_memory_usage();
+    let cpu = get_cpu_usage();
     let inbounds = pool.get_inbound_stats();
     let clients = pool.client_manager.get_views();
 
@@ -291,6 +398,7 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
         backends,
         tree,
         memory,
+        cpu,
         inbounds,
         clients,
         domains,

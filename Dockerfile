@@ -18,7 +18,7 @@ RUN cargo build --release --features filter
 FROM debian:trixie-slim
 
 RUN apt-get update && \
-    apt-get install -y ca-certificates && \
+    apt-get install -y ca-certificates curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy Rust backend binary (now contains the bundled frontend)

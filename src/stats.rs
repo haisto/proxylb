@@ -46,6 +46,9 @@ impl ClientStatsManager {
     }
 
     pub fn get_or_create(&self, id: &ClientId) -> Arc<ClientStats> {
+        if let Some(stats) = self.map.get(id) {
+            return stats.clone();
+        }
         self.map
             .entry(id.clone())
             .or_insert_with(|| Arc::new(ClientStats::default()))

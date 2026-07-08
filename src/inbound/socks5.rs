@@ -214,7 +214,7 @@ where
 
     // Try backends in order with fallback.
     let (backend_stream, chosen_traffic) =
-        match crate::inbound::route_and_connect(&pool, &target, route_idx).await {
+        match crate::router::route_and_connect(&pool, &target, route_idx).await {
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(target = %target, error = %e, "all backends failed");
@@ -390,7 +390,7 @@ where
                 let session = if let Some(session) = backend_map.get(&target) {
                     session.clone()
                 } else {
-                    match crate::inbound::route_and_connect_udp(&pool, &target, route_idx).await {
+                    match crate::router::route_and_connect_udp(&pool, &target, route_idx).await {
                         Ok((session, _traffic)) => {
                             let session = Arc::new(session);
                             backend_map.insert(target.clone(), session.clone());

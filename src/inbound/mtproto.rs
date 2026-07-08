@@ -370,7 +370,7 @@ async fn connect_and_proxy(
     }
 
     let (mut backend_stream, chosen_traffic) =
-        crate::inbound::route_and_connect(&pool, &target_addr, route_idx).await?;
+        crate::router::route_and_connect(&pool, &target_addr, route_idx).await?;
 
     let (nonce, tg_encryptor, tg_decryptor) = generate_and_encrypt_tg_nonce(
         validation.proto_tag,
