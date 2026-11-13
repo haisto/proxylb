@@ -4,7 +4,9 @@ on:
   push:
     tags:
       - 'v*'
-
+on:
+  workflow_dispatch:
+  
 jobs:
   build:
     name: Build ${{ matrix.target }}
