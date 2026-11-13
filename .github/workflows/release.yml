@@ -14,9 +14,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            use-cross: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use-cross: false
@@ -26,7 +23,16 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             use-cross: false
-
+          # ===== 新增 musl 静态目标 =====
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            static: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use-cross: true
+            static: true
+          # ==============================
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,9 +62,27 @@ jobs:
         if: ${{ !matrix.use-cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Build with cross
-        if: matrix.use-cross
+      - name: Build with cross (GNU)
+        if: ${{ matrix.use-cross && !matrix.static }}
         run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build with cross (musl static)
+        if: matrix.static
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+          # 强制 libsqlite3-sys 使用 bundled SQLite，避免依赖 musl 系统里的 sqlite 共享库
+          LIBSQLITE3_SYS_USE_PKG_CONFIG: "0"
+          SQLITE3_STATIC: "1"
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Verify static linkage (musl)
+        if: matrix.static
+        run: |
+          file "target/${{ matrix.target }}/release/proxylb"
+          if file "target/${{ matrix.target }}/release/proxylb" | grep -q "dynamically linked"; then
+            echo "ERROR: binary is dynamically linked, static build failed" >&2
+            exit 1
+          fi
 
       - name: Rename binary
         run: |
